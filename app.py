@@ -4,22 +4,35 @@ import random
 import google.generativeai as genai
 
 # Configure Gemini API key
-GEMINI_API_KEY = st.secrets["GEMINI_KEY"]
-genai.configure(api_key=GEMINI_API_KEY)
+# Make sure "GEMINI_KEY" is set in your Streamlit secrets
+try:
+    GEMINI_API_KEY = st.secrets["GEMINI_KEY"]
+    genai.configure(api_key=GEMINI_API_KEY)
+except (KeyError, FileNotFoundError):
+    st.error("Gemini API key not found. Please set `GEMINI_KEY` in your Streamlit secrets.")
+    st.stop()
+
 
 # Store Tavily API keys securely in Streamlit secrets
-API_KEYS = [
-    st.secrets["TAVILY_KEY_1"],
-    st.secrets["TAVILY_KEY_2"],
-    st.secrets["TAVILY_KEY_3"],
-    st.secrets["TAVILY_KEY_4"],
-    st.secrets["TAVILY_KEY_5"],
-    st.secrets["TAVILY_KEY_6"]
-]
+# Ensure these are also set in your Streamlit secrets
+try:
+    API_KEYS = [
+        st.secrets["TAVILY_KEY_1"],
+        st.secrets["TAVILY_KEY_2"],
+        st.secrets["TAVILY_KEY_3"],
+        st.secrets["TAVILY_KEY_4"],
+        st.secrets["TAVILY_KEY_5"],
+        st.secrets["TAVILY_KEY_6"]
+    ]
+except (KeyError, FileNotFoundError):
+    st.error("Tavily API keys not found. Please set `TAVILY_KEY_1` through `TAVILY_KEY_6` in your Streamlit secrets.")
+    st.stop()
+
 TAVILY_URL = "https://api.tavily.com/search"
 
 st.title("Variant Clinical Significance Search (Tavily API + Gemini Summary)")
 
+# --- Session State Initialization ---
 # Maintain a list of variants using session state
 if "variants" not in st.session_state:
     st.session_state.variants = [""]
@@ -28,6 +41,7 @@ if "variants" not in st.session_state:
 if "cache" not in st.session_state:
     st.session_state.cache = {}
 
+# --- UI Components ---
 # Add new variant input
 def add_variant():
     st.session_state.variants.append("")
@@ -40,32 +54,43 @@ for i, variant in enumerate(st.session_state.variants):
 if st.button("Add another variant"):
     add_variant()
 
+# --- API Functions ---
 # Search function with caching
 def search_tavily(query):
+    """Performs a search using the Tavily API and caches the result."""
     if query in st.session_state.cache:
         return st.session_state.cache[query]
 
     api_key = random.choice(API_KEYS)  # Randomly select a key each time
     headers = {"Authorization": f"Bearer {api_key}"}
-    payload = {"query": query, "search_depth": "advanced"}  # switched to advanced for better results
-    response = requests.post(TAVILY_URL, json=payload, headers=headers)
-    if response.status_code == 200:
+    payload = {"query": query, "search_depth": "advanced"}
+    
+    try:
+        response = requests.post(TAVILY_URL, json=payload, headers=headers)
+        response.raise_for_status()  # Raises an HTTPError for bad responses (4xx or 5xx)
         result = response.json()
         st.session_state.cache[query] = result
         return result
-    else:
-        return {"error": f"Request failed with status {response.status_code}"}
+    except requests.exceptions.RequestException as e:
+        return {"error": f"Tavily API request failed: {e}"}
+
 
 # Function to create integrated summary with Gemini and multiple fallbacks
 def summarize_with_gemini(snippets, variant_name):
-    if not snippets:
-        return f"No relevant snippets found for {variant_name}."
+    """
+    Summarizes search snippets using the Gemini API with a fallback model strategy.
     
-    prompt = f"Summarize the following search results about {variant_name} into a concise clinical interpretation, focusing on clinical significance, pathogenicity classification (ACMG if available), and evidence sources.\n\n{' '.join(snippets)}"
+    CORRECTION: Updated the model list to valid and current model names.
+    The previous list contained invalid names like "gemini-2.0-flash".
+    """
+    if not snippets:
+        return f"No relevant snippets found for {variant_name} to summarize."
+    
+    prompt = f"Summarize the following search results about the genetic variant '{variant_name}' into a concise clinical interpretation. Focus on its clinical significance, pathogenicity classification (mentioning ACMG guidelines if available), associated conditions, and cite the evidence sources from the text.\n\n---BEGIN SNIPPETS---\n{' '.join(snippets)}\n---END SNIPPETS---"
+    
+    # List of valid models to try, from fastest/cheapest to most powerful
     models_to_try = [
-        "gemini-2.0-flash",
-        "gemini-2.0-pro",
-        "gemini-1.5-flash",
+        "gemini-1.5-flash-latest",
         "gemini-pro"
     ]
 
@@ -73,24 +98,49 @@ def summarize_with_gemini(snippets, variant_name):
         try:
             model = genai.GenerativeModel(model_name)
             response = model.generate_content(prompt)
-            if response and hasattr(response, 'text'):
+            
+            # Check if the response has text content
+            if response.text:
                 return response.text
-        except Exception as e:
-            st.warning(f"Model {model_name} failed: {e}. Trying next model...")
-    
-    return f"Unable to generate summary for {variant_name} after trying all backup models."
+            # Check for safety blocks or other reasons for empty response
+            elif response.prompt_feedback.block_reason:
+                 st.warning(f"Model {model_name} blocked the prompt. Reason: {response.prompt_feedback.block_reason.name}")
+                 continue # Try the next model
+            else:
+                st.warning(f"Model {model_name} returned an empty response.")
 
+        except Exception as e:
+            st.warning(f"Model {model_name} failed with an error: {e}. Trying next model...")
+    
+    return f"Unable to generate summary for {variant_name} after trying all available models."
+
+# --- Main Logic ---
 # Search all variants and display integrated summaries
 if st.button("Search Clinical Significance"):
-    for variant in st.session_state.variants:
-        if variant.strip():
-            query = f"Please investigate the clinical significance of {variant}"
-            st.write(f"**Searching for:** {variant}")
-            result = search_tavily(query)
-            if "error" in result:
-                st.error(result["error"])
-            else:
-                snippets = [r.get("snippet", "") for r in result.get("results", []) if r.get("snippet")]
-                summary = summarize_with_gemini(snippets, variant)
-                st.markdown(f"**Gemini Clinical Summary for {variant}:**\n\n{summary}")
+    # Filter out empty variant inputs before processing
+    active_variants = [v for v in st.session_state.variants if v.strip()]
+    
+    if not active_variants:
+        st.warning("Please enter at least one variant to search.")
+    else:
+        with st.spinner("Searching for clinical significance and generating summaries..."):
+            for variant in active_variants:
+                query = f"clinical significance of genetic variant {variant}"
+                st.write(f"**Searching for:** `{variant}`")
+                
+                result = search_tavily(query)
+
+                if "error" in result:
+                    st.error(result["error"])
+                elif not result.get("results"):
+                     st.warning(f"No search results found for `{variant}`.")
+                else:
+                    # Extract snippets, ensuring they are not empty
+                    snippets = [r.get("snippet", "") for r in result.get("results", []) if r.get("snippet")]
+                    summary = summarize_with_gemini(snippets, variant)
+                    
+                    st.markdown(f"### Gemini Clinical Summary for `{variant}`")
+                    st.markdown(summary)
+                
                 st.write("---")
+
