@@ -1,8 +1,13 @@
 import streamlit as st
 import requests
 import random
+import google.generativeai as genai
 
-# Store API keys securely in Streamlit secrets
+# Configure Gemini API key
+GEMINI_API_KEY = st.secrets["GEMINI_KEY"]
+genai.configure(api_key=GEMINI_API_KEY)
+
+# Store Tavily API keys securely in Streamlit secrets
 API_KEYS = [
     st.secrets["TAVILY_KEY_1"],
     st.secrets["TAVILY_KEY_2"],
@@ -13,7 +18,7 @@ API_KEYS = [
 ]
 TAVILY_URL = "https://api.tavily.com/search"
 
-st.title("Variant Clinical Significance Search (Tavily API)")
+st.title("Variant Clinical Significance Search (Tavily API + Gemini Summary)")
 
 # Maintain a list of variants using session state
 if "variants" not in st.session_state:
@@ -51,7 +56,27 @@ def search_tavily(query):
     else:
         return {"error": f"Request failed with status {response.status_code}"}
 
-# Search all variants
+# Function to create integrated summary with Gemini and multiple fallbacks
+def summarize_with_gemini(snippets):
+    prompt = f"Summarize the following search snippets into a concise clinical interpretation, focusing on clinical significance, pathogenicity classification (ACMG if available), and evidence sources.\n\n{' '.join(snippets)}"
+    models_to_try = [
+        "gemini-2.0-flash",
+        "gemini-2.0-pro",
+        "gemini-1.5-flash",
+        "gemini-pro"
+    ]
+
+    for model_name in models_to_try:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            st.warning(f"Model {model_name} failed: {e}. Trying next model...")
+    
+    return "Unable to generate summary after trying all backup models."
+
+# Search all variants and display integrated summaries
 if st.button("Search Clinical Significance"):
     for variant in st.session_state.variants:
         if variant.strip():
@@ -61,8 +86,12 @@ if st.button("Search Clinical Significance"):
             if "error" in result:
                 st.error(result["error"])
             else:
-                for r in result.get("results", []):
-                    st.markdown(f"- [{r.get('title')}]({r.get('url')})")
-                    st.write(r.get("snippet"))
+                snippets = [r.get("snippet", "") for r in result.get("results", []) if r.get("snippet")]
+                if snippets:
+                    summary = summarize_with_gemini(snippets)
+                    st.markdown(f"**Gemini Clinical Summary:**\n\n{summary}")
+                else:
+                    st.write("No summary available.")
                 st.write("---")
+
 
