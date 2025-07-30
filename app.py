@@ -141,18 +141,30 @@ def fetch_from_oncokb_headless(hugo_symbol, alteration, tumor_type):
         return {'error': f"Network Error: {e}"}
 
 def summarize_with_gemini(prompt):
+    """
+    FIX: This function now captures and returns the last error message if all
+    API calls fail, providing better debugging information.
+    """
     warnings = []
+    last_error = None
     models_to_try = ["gemini-1.5-flash-latest", "gemini-pro"]
     for model_name in models_to_try:
         try:
             model = genai.GenerativeModel(model_name)
             response = model.generate_content(prompt)
             if response.text:
-                return {"summary": response.text, "warnings": warnings}
+                return {"summary": response.text, "warnings": warnings, "error": None}
             warnings.append(f"Model {model_name} returned an empty or blocked response.")
+            last_error = "Model returned an empty or blocked response."
         except Exception as e:
             warnings.append(f"Model {model_name} failed: {e}")
-    return {"summary": "Unable to generate summary after trying all models.", "warnings": warnings}
+            last_error = str(e)
+            
+    final_summary = "Unable to generate summary."
+    if last_error:
+        final_summary += f" Last known error: {last_error}"
+        
+    return {"summary": final_summary, "warnings": warnings, "error": last_error}
 
 
 # --- Processing Logic ---
@@ -169,9 +181,9 @@ def process_tavily_search(variant, search_result):
 
 def process_oncokb_search(variant_gene, variant_alt, search_result):
     """
-    FIX: This function now extracts diagnostic and prognostic implications
-    to build a much richer, more effective prompt for the summarization model.
+    FIX: This function now returns the generated prompt for debugging purposes.
     """
+    prompt_text = ""
     if "error" in search_result:
         summary_data = {"summary": f"OncoKB API Error: {search_result['error']}", "warnings": []}
     elif search_result.get('query', {}).get('variant') == "UNKNOWN":
@@ -187,7 +199,6 @@ def process_oncokb_search(variant_gene, variant_alt, search_result):
         if variant_summary:
             prompt_text += f"**Variant Summary:** {variant_summary}\n\n"
         
-        # --- CHANGE: Extract Diagnostic Implications ---
         diag_implications = search_result.get('diagnosticImplications')
         if diag_implications:
             prompt_text += "**Diagnostic Implications:**\n"
@@ -197,7 +208,6 @@ def process_oncokb_search(variant_gene, variant_alt, search_result):
                 prompt_text += f"- **Tumor Type:** {tumor_name} (Level: {level})\n"
             prompt_text += "\n"
 
-        # --- CHANGE: Extract Prognostic Implications ---
         prog_implications = search_result.get('prognosticImplications')
         if prog_implications:
             prompt_text += "**Prognostic Implications:**\n"
@@ -218,7 +228,7 @@ def process_oncokb_search(variant_gene, variant_alt, search_result):
         
         summary_data = summarize_with_gemini(prompt_text)
 
-    return {"variant": f"{variant_gene} {variant_alt}", "summary_data": summary_data, "oncokb_data": search_result}
+    return {"variant": f"{variant_gene} {variant_alt}", "summary_data": summary_data, "oncokb_data": search_result, "prompt": prompt_text}
 
 
 # --- Main Application Flow ---
@@ -296,10 +306,15 @@ if search_button_pressed:
                                     st.markdown(f"#### Summary for `{res['variant']}`")
                                     st.markdown(res['summary_data']['summary'])
                                     
+                                    # --- CHANGE: Display prompt and raw data for debugging ---
                                     if res.get('oncokb_data') and 'query' in res['oncokb_data']:
                                         q = res['oncokb_data']['query']
                                         link = f"https://www.oncokb.org/gene/{q.get('hugoSymbol', '')}/{q.get('alteration', '')}"
                                         st.link_button("View on OncoKB", link)
-                                        with st.expander("Show Raw OncoKB Data"):
+                                        with st.expander("Show Debugging Info"):
+                                            st.markdown("**Prompt sent to Gemini:**")
+                                            st.text(res.get("prompt", "No prompt was generated."))
+                                            st.markdown("**Raw OncoKB Data:**")
                                             st.json(res['oncokb_data'])
                                     st.divider()
+
