@@ -49,6 +49,13 @@ if "query_template" not in st.session_state:
     st.session_state.query_template = "clinical significance of genetic variant {variant}"
 if "tumor_type" not in st.session_state:
     st.session_state.tumor_type = ""
+# --- CHANGE ---: Add checkboxes to session state
+if "include_tavily" not in st.session_state:
+    st.session_state.include_tavily = True
+if "include_oncokb" not in st.session_state:
+    st.session_state.include_oncokb = True
+if "include_perplexity" not in st.session_state:
+    st.session_state.include_perplexity = True
 
 
 # --- UI Components ---
@@ -67,6 +74,13 @@ with st.sidebar:
         value=st.session_state.tumor_type,
         help="Applies to both Web and OncoKB searches (e.g., 'Melanoma')."
     )
+    
+    # --- CHANGE ---: Add checkboxes to control data sources
+    st.header("Data Sources to Query")
+    st.session_state.include_tavily = st.checkbox("Tavily Web Search", value=st.session_state.include_tavily)
+    st.session_state.include_oncokb = st.checkbox("OncoKB Database", value=st.session_state.include_oncokb)
+    st.session_state.include_perplexity = st.checkbox("Perplexity Quick Links", value=st.session_state.include_perplexity)
+
     st.header("API Status")
     st.success("Gemini API Key: Found")
     st.success("Tavily API Keys: Found")
@@ -104,14 +118,9 @@ def fetch_from_tavily_headless(query):
         return {"error": f"Tavily API request failed: {e}"}
 
 def fetch_from_oncokb_headless(hugo_symbol, alteration, tumor_type):
-    """
-    FIX: This function now ensures all inputs to the OncoKB API are uppercased
-    to prevent case-sensitivity issues.
-    """
     if not ONCOKB_API_TOKEN:
         return {"error": "OncoKB API Token not configured."}
     
-    # Uppercase all inputs for API compatibility
     hugo_symbol_upper = hugo_symbol.upper()
     alteration_upper = alteration.upper()
     tumor_type_upper = tumor_type.upper()
@@ -198,65 +207,81 @@ if search_button_pressed:
     if not active_variants:
         st.warning("Please enter at least one variant to search.")
     else:
-        query_template = st.session_state.query_template
-        tumor_type = st.session_state.tumor_type.strip()
-        
-        tab1, tab2, tab3 = st.tabs(["Web Search (Tavily)", "OncoKB Search", "Quick Links (Perplexity)"])
+        # --- CHANGE ---: Build list of tabs based on user selection
+        tabs_to_show = []
+        if st.session_state.include_tavily:
+            tabs_to_show.append("Web Search (Tavily)")
+        if st.session_state.include_oncokb:
+            tabs_to_show.append("OncoKB Search")
+        if st.session_state.include_perplexity:
+            tabs_to_show.append("Quick Links (Perplexity)")
 
-        with tab3:
-            st.markdown("### Quick Search Links")
-            for variant in active_variants:
-                base_query = query_template.format(variant=variant)
-                full_query = f"{base_query} in {tumor_type}" if tumor_type else base_query
-                perplexity_url = f"https://www.perplexity.ai/search?q={quote(full_query)}"
-                st.markdown(f"**For `{variant}`:**")
-                st.link_button("Ask Perplexity.ai", perplexity_url)
-            st.write("---")
+        if not tabs_to_show:
+            st.warning("Please select at least one data source to query.")
+        else:
+            # Create the tabs dynamically
+            created_tabs = st.tabs(tabs_to_show)
+            tab_map = {name: tab for name, tab in zip(tabs_to_show, created_tabs)}
 
-        with st.spinner("Fetching and summarizing results..."):
-            # --- Tavily Search Execution ---
-            with tab1:
-                st.markdown("### Web Search Summaries (Tavily + Gemini)")
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future_to_variant = {executor.submit(fetch_from_tavily_headless, f"{query_template.format(variant=v)} {'in ' + tumor_type if tumor_type else ''}"): v for v in active_variants}
-                    search_results = {future_to_variant[future]: future.result() for future in concurrent.futures.as_completed(future_to_variant)}
-                    
-                    summary_futures = {executor.submit(process_tavily_search, v, search_results.get(v, {})): v for v in active_variants}
-                    for future in concurrent.futures.as_completed(summary_futures):
-                        res = future.result()
-                        st.markdown(f"#### Summary for `{res['variant']}`")
-                        st.markdown(res['summary_data']['summary'])
-                        if res.get("sources"):
-                            with st.expander("Show Sources"):
-                                for url in res["sources"]: st.markdown(f"- {url}")
-                        st.divider()
+            query_template = st.session_state.query_template
+            tumor_type = st.session_state.tumor_type.strip()
+            
+            with st.spinner("Fetching and summarizing results..."):
 
-            # --- OncoKB Search Execution ---
-            with tab2:
-                st.markdown("### OncoKB Summaries (OncoKB + Gemini)")
-                if not ONCOKB_API_TOKEN:
-                    st.error("OncoKB search is disabled. Please add your `ONCOKB_API_KEY` to your Streamlit secrets.")
-                else:
-                    with concurrent.futures.ThreadPoolExecutor() as executor:
-                        parsed_variants = []
-                        for v in active_variants:
-                            parts = v.split(' ', 1)
-                            if len(parts) == 2: parsed_variants.append({'gene': parts[0], 'alt': parts[1], 'original': v})
-                            else: st.warning(f"Could not parse gene/alteration for '{v}'. Skipping OncoKB search.")
-                        
-                        future_to_variant = {executor.submit(fetch_from_oncokb_headless, pv['gene'], pv['alt'], tumor_type): pv for pv in parsed_variants}
-                        search_results = {future_to_variant[future]['original']: future.result() for future in concurrent.futures.as_completed(future_to_variant)}
-                        
-                        summary_futures = {executor.submit(process_oncokb_search, pv['gene'], pv['alt'], search_results.get(pv['original'], {})): pv['original'] for pv in parsed_variants}
-                        for future in concurrent.futures.as_completed(summary_futures):
-                            res = future.result()
-                            st.markdown(f"#### Summary for `{res['variant']}`")
-                            st.markdown(res['summary_data']['summary'])
+                if st.session_state.include_perplexity and "Quick Links (Perplexity)" in tab_map:
+                    with tab_map["Quick Links (Perplexity)"]:
+                        st.markdown("### Quick Search Links")
+                        for variant in active_variants:
+                            base_query = query_template.format(variant=variant)
+                            full_query = f"{base_query} in {tumor_type}" if tumor_type else base_query
+                            perplexity_url = f"https://www.perplexity.ai/search?q={quote(full_query)}"
+                            st.markdown(f"**For `{variant}`:**")
+                            st.link_button("Ask Perplexity.ai", perplexity_url)
+                        st.write("---")
+
+                if st.session_state.include_tavily and "Web Search (Tavily)" in tab_map:
+                    with tab_map["Web Search (Tavily)"]:
+                        st.markdown("### Web Search Summaries (Tavily + Gemini)")
+                        with concurrent.futures.ThreadPoolExecutor() as executor:
+                            future_to_variant = {executor.submit(fetch_from_tavily_headless, f"{query_template.format(variant=v)} {'in ' + tumor_type if tumor_type else ''}"): v for v in active_variants}
+                            search_results = {future_to_variant[future]: future.result() for future in concurrent.futures.as_completed(future_to_variant)}
                             
-                            if res.get('oncokb_data') and 'query' in res['oncokb_data']:
-                                q = res['oncokb_data']['query']
-                                link = f"https://www.oncokb.org/gene/{q.get('hugoSymbol', '')}/{q.get('alteration', '')}"
-                                st.link_button("View on OncoKB", link)
-                                with st.expander("Show Raw OncoKB Data"):
-                                    st.json(res['oncokb_data'])
-                            st.divider()
+                            summary_futures = {executor.submit(process_tavily_search, v, search_results.get(v, {})): v for v in active_variants}
+                            for future in concurrent.futures.as_completed(summary_futures):
+                                res = future.result()
+                                st.markdown(f"#### Summary for `{res['variant']}`")
+                                st.markdown(res['summary_data']['summary'])
+                                if res.get("sources"):
+                                    with st.expander("Show Sources"):
+                                        for url in res["sources"]: st.markdown(f"- {url}")
+                                st.divider()
+
+                if st.session_state.include_oncokb and "OncoKB Search" in tab_map:
+                    with tab_map["OncoKB Search"]:
+                        st.markdown("### OncoKB Summaries (OncoKB + Gemini)")
+                        if not ONCOKB_API_TOKEN:
+                            st.error("OncoKB search is disabled. Please add your `ONCOKB_API_KEY` to your Streamlit secrets.")
+                        else:
+                            with concurrent.futures.ThreadPoolExecutor() as executor:
+                                parsed_variants = []
+                                for v in active_variants:
+                                    parts = v.split(' ', 1)
+                                    if len(parts) == 2: parsed_variants.append({'gene': parts[0], 'alt': parts[1], 'original': v})
+                                    else: st.warning(f"Could not parse gene/alteration for '{v}'. Skipping OncoKB search.")
+                                
+                                future_to_variant = {executor.submit(fetch_from_oncokb_headless, pv['gene'], pv['alt'], tumor_type): pv for pv in parsed_variants}
+                                search_results = {future_to_variant[future]['original']: future.result() for future in concurrent.futures.as_completed(future_to_variant)}
+                                
+                                summary_futures = {executor.submit(process_oncokb_search, pv['gene'], pv['alt'], search_results.get(pv['original'], {})): pv['original'] for pv in parsed_variants}
+                                for future in concurrent.futures.as_completed(summary_futures):
+                                    res = future.result()
+                                    st.markdown(f"#### Summary for `{res['variant']}`")
+                                    st.markdown(res['summary_data']['summary'])
+                                    
+                                    if res.get('oncokb_data') and 'query' in res['oncokb_data']:
+                                        q = res['oncokb_data']['query']
+                                        link = f"https://www.oncokb.org/gene/{q.get('hugoSymbol', '')}/{q.get('alteration', '')}"
+                                        st.link_button("View on OncoKB", link)
+                                        with st.expander("Show Raw OncoKB Data"):
+                                            st.json(res['oncokb_data'])
+                                    st.divider()
