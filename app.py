@@ -129,6 +129,10 @@ if st.button("Search Clinical Significance"):
                 st.write(f"**Searching for:** `{variant}`")
                 
                 result = search_tavily(query)
+                
+                # --- DEBUGGING LINE ---
+                # Display the raw JSON result from the Tavily API to inspect its contents.
+                st.json(result)
 
                 if "error" in result:
                     st.error(result["error"])
