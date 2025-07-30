@@ -3,6 +3,7 @@ import requests
 import random
 import google.generativeai as genai
 import concurrent.futures
+from urllib.parse import quote
 
 # Configure Gemini API key
 # Make sure "GEMINI_KEY" is set in your Streamlit secrets
@@ -38,8 +39,28 @@ if "variants" not in st.session_state:
     st.session_state.variants = [""]
 if "cache" not in st.session_state:
     st.session_state.cache = {}
+if "query_template" not in st.session_state:
+    st.session_state.query_template = "clinical significance of genetic variant {variant}"
+# --- CHANGE ---: Add tumor_type to session state
+if "tumor_type" not in st.session_state:
+    st.session_state.tumor_type = ""
+
 
 # --- UI Components ---
+st.session_state.query_template = st.text_area(
+    "Search Query Template",
+    value=st.session_state.query_template,
+    help="Define the base search query. Use `{variant}` as a placeholder for the variant name. The tumor type will be appended if provided."
+)
+
+# --- CHANGE ---: Add a text input for the optional tumor type
+st.session_state.tumor_type = st.text_input(
+    "Tumor Type (Optional)",
+    value=st.session_state.tumor_type,
+    help="If provided, this will be added to the search query (e.g., '...in breast cancer')."
+)
+
+
 def add_variant():
     st.session_state.variants.append("")
 
@@ -102,15 +123,17 @@ def process_variant_summary(variant, search_result):
     Processes a single variant's search result to generate a summary.
     This function is designed to be run in a separate thread.
     """
+    sources = []
     if "error" in search_result:
         summary_data = {"summary": f"Error during search: {search_result['error']}", "warnings": []}
     elif not search_result.get("results"):
         summary_data = {"summary": f"No search results found for `{variant}`.", "warnings": []}
     else:
         content_list = [r.get("content", "") for r in search_result.get("results", []) if r.get("content")]
+        sources = [r.get("url") for r in search_result.get("results", []) if r.get("url")]
         summary_data = summarize_with_gemini(content_list, variant)
         
-    return {"variant": variant, "summary_data": summary_data}
+    return {"variant": variant, "summary_data": summary_data, "sources": sources}
 
 if st.button("Search Clinical Significance"):
     active_variants = [v for v in st.session_state.variants if v.strip()]
@@ -118,23 +141,42 @@ if st.button("Search Clinical Significance"):
     if not active_variants:
         st.warning("Please enter at least one variant to search.")
     else:
-        with st.spinner(f"Searching for {len(active_variants)} variant(s) and generating summaries... This may take a moment."):
+        query_template = st.session_state.query_template
+        # --- CHANGE ---: Get tumor type from session state
+        tumor_type = st.session_state.tumor_type.strip()
+
+        st.markdown("### Quick Search Links")
+        for variant in active_variants:
+            # --- CHANGE ---: Construct the full query including the optional tumor type
+            base_query = query_template.format(variant=variant)
+            full_query = f"{base_query} in {tumor_type}" if tumor_type else base_query
             
-            # Step 1: (MAIN THREAD) Separate cached vs. non-cached variants
+            perplexity_url = f"https://www.perplexity.ai/search?q={quote(full_query)}"
+            st.markdown(f"**For `{variant}`:**")
+            st.link_button("Ask Perplexity.ai", perplexity_url)
+        st.write("---")
+        
+        with st.spinner(f"Now fetching and summarizing results for {len(active_variants)} variant(s)... This may take a moment."):
+            
             variants_to_fetch = []
             variant_to_search_result = {}
+            # --- CHANGE ---: This dictionary will hold the final query for each variant
+            variant_queries = {}
+
             for variant in active_variants:
-                query = f"clinical significance of genetic variant {variant}"
-                if query in st.session_state.cache:
-                    variant_to_search_result[variant] = st.session_state.cache[query]
+                base_query = query_template.format(variant=variant)
+                full_query = f"{base_query} in {tumor_type}" if tumor_type else base_query
+                variant_queries[variant] = full_query
+                
+                if full_query in st.session_state.cache:
+                    variant_to_search_result[variant] = st.session_state.cache[full_query]
                 else:
                     variants_to_fetch.append(variant)
 
-            # Step 2: (BACKGROUND THREADS) Fetch only the uncached variants from the API
             if variants_to_fetch:
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     future_to_variant = {
-                        executor.submit(fetch_from_tavily_headless, f"clinical significance of genetic variant {variant}"): variant 
+                        executor.submit(fetch_from_tavily_headless, variant_queries[variant]): variant 
                         for variant in variants_to_fetch
                     }
                     
@@ -143,13 +185,11 @@ if st.button("Search Clinical Significance"):
                         try:
                             search_result = future.result()
                             variant_to_search_result[variant] = search_result
-                            # (MAIN THREAD) Update the cache with the new result
-                            query = f"clinical significance of genetic variant {variant}"
+                            query = variant_queries[variant]
                             st.session_state.cache[query] = search_result
                         except Exception as exc:
                             variant_to_search_result[variant] = {"error": f"Generated an exception during search: {exc}"}
 
-            # Step 3: (BACKGROUND THREADS) Summarize all results in parallel
             final_results = []
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 summary_futures = {
@@ -159,14 +199,24 @@ if st.button("Search Clinical Significance"):
                 for future in concurrent.futures.as_completed(summary_futures):
                     final_results.append(future.result())
 
-            # Step 4: (MAIN THREAD) Display results in the original order
+            st.markdown("### Detailed Summaries")
             results_dict = {res['variant']: res for res in final_results}
             for variant in active_variants:
                 res = results_dict.get(variant)
                 if res:
-                    st.markdown(f"### Gemini Clinical Summary for `{res['variant']}`")
+                    st.markdown(f"#### Gemini Clinical Summary for `{res['variant']}`")
+                    # --- CHANGE ---: Display the final, full query that was sent
+                    st.info(f"**Query sent:** `{variant_queries[variant]}`")
+
                     if res["summary_data"]["warnings"]:
                         for warning_text in res["summary_data"]["warnings"]:
                             st.warning(warning_text)
                     st.markdown(res["summary_data"]["summary"])
+                    
+                    if res.get("sources"):
+                        st.markdown("**Sources:**")
+                        for source_url in res["sources"]:
+                            st.markdown(f"- [{source_url}]({source_url})")
+
                     st.write("---")
+
