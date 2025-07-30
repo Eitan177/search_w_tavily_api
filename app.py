@@ -50,28 +50,26 @@ if st.button("Add another variant"):
     add_variant()
 
 # --- API Functions ---
-def search_tavily(query):
-    """Performs a search using the Tavily API and caches the result."""
-    if query in st.session_state.cache:
-        return st.session_state.cache[query]
+def fetch_from_tavily_headless(query):
+    """
+    Performs a search using the Tavily API. 
+    This version is 'headless' and does NOT interact with st.session_state,
+    making it safe to run in a background thread.
+    """
     api_key = random.choice(API_KEYS)
     headers = {"Authorization": f"Bearer {api_key}"}
     payload = {"query": query, "search_depth": "advanced"}
     try:
         response = requests.post(TAVILY_URL, json=payload, headers=headers)
         response.raise_for_status()
-        result = response.json()
-        st.session_state.cache[query] = result
-        return result
+        return response.json()
     except requests.exceptions.RequestException as e:
         return {"error": f"Tavily API request failed: {e}"}
 
 def summarize_with_gemini(search_content, variant_name):
     """
     Summarizes search content using the Gemini API.
-    
-    FIX: This function no longer calls st.warning. It returns warnings as data
-    to be displayed by the main thread, avoiding Streamlit's threading issues.
+    Returns warnings as data to be displayed by the main thread.
     """
     warnings = []
     if not search_content:
@@ -86,7 +84,6 @@ def summarize_with_gemini(search_content, variant_name):
             model = genai.GenerativeModel(model_name)
             response = model.generate_content(prompt)
             if response.text:
-                # Success, return the summary and any warnings from previous failed models
                 return {"summary": response.text, "warnings": warnings}
             elif response.prompt_feedback.block_reason:
                 warnings.append(f"Model {model_name} blocked the prompt. Reason: {response.prompt_feedback.block_reason.name}")
@@ -100,20 +97,17 @@ def summarize_with_gemini(search_content, variant_name):
     return {"summary": final_summary, "warnings": warnings}
 
 # --- Main Logic ---
-def process_variant(variant):
+def process_variant(variant, search_result):
     """
-    Encapsulates the full search and summary process for a single variant.
+    Processes a single variant's search result to generate a summary.
     This function is designed to be run in a separate thread.
     """
-    query = f"clinical significance of genetic variant {variant}"
-    result = search_tavily(query)
-    
-    if "error" in result:
-        summary_data = {"summary": f"Error searching for variant: {result['error']}", "warnings": []}
-    elif not result.get("results"):
+    if "error" in search_result:
+        summary_data = {"summary": f"Error searching for variant: {search_result['error']}", "warnings": []}
+    elif not search_result.get("results"):
         summary_data = {"summary": f"No search results found for `{variant}`.", "warnings": []}
     else:
-        content_list = [r.get("content", "") for r in result.get("results", []) if r.get("content")]
+        content_list = [r.get("content", "") for r in search_result.get("results", []) if r.get("content")]
         summary_data = summarize_with_gemini(content_list, variant)
         
     return {"variant": variant, "summary_data": summary_data}
@@ -125,19 +119,45 @@ if st.button("Search Clinical Significance"):
         st.warning("Please enter at least one variant to search.")
     else:
         with st.spinner(f"Searching for {len(active_variants)} variant(s) and generating summaries... This may take a moment."):
-            # Use a ThreadPoolExecutor to run API calls concurrently
+            
+            # Step 1: Fetch all data (from cache or API) in parallel
             with concurrent.futures.ThreadPoolExecutor() as executor:
-                # map the process_variant function to all active_variants
-                results = list(executor.map(process_variant, active_variants))
+                # Create a map of variant to future object
+                future_to_variant = {}
+                for variant in active_variants:
+                    query = f"clinical significance of genetic variant {variant}"
+                    if query in st.session_state.cache:
+                        # If cached, create a future that just returns the cached data
+                        future = executor.submit(lambda v: st.session_state.cache[v], query)
+                    else:
+                        # If not cached, submit the headless API call to the thread pool
+                        future = executor.submit(fetch_from_tavily_headless, query)
+                    future_to_variant[future] = variant
 
-            # Display results after all threads have completed
+                # Step 2: Process results as they complete
+                variant_to_search_result = {}
+                for future in concurrent.futures.as_completed(future_to_variant):
+                    variant = future_to_variant[future]
+                    try:
+                        search_result = future.result()
+                        variant_to_search_result[variant] = search_result
+                        # Add new results to the cache in the main thread
+                        query = f"clinical significance of genetic variant {variant}"
+                        if query not in st.session_state.cache:
+                            st.session_state.cache[query] = search_result
+                    except Exception as exc:
+                        variant_to_search_result[variant] = {"error": f"Generated an exception: {exc}"}
+
+            # Step 3: Summarize all results in parallel
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                summary_futures = [executor.submit(process_variant, variant, result) for variant, result in variant_to_search_result.items()]
+                results = [f.result() for f in concurrent.futures.as_completed(summary_futures)]
+
+            # Step 4: Display results
             for res in results:
                 st.markdown(f"### Gemini Clinical Summary for `{res['variant']}`")
-                
-                # FIX: Display warnings from the main thread
                 if res["summary_data"]["warnings"]:
                     for warning_text in res["summary_data"]["warnings"]:
                         st.warning(warning_text)
-
                 st.markdown(res["summary_data"]["summary"])
                 st.write("---")
