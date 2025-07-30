@@ -3,6 +3,7 @@ import requests
 import random
 import google.generativeai as genai
 import concurrent.futures
+import json
 from urllib.parse import quote
 
 # --- Page and API Configuration ---
@@ -30,7 +31,7 @@ except (KeyError, FileNotFoundError):
     st.error("Tavily API keys not found. Please set `TAVILY_KEY_1` through `TAVILY_KEY_6` in your Streamlit secrets.")
     st.stop()
 
-# --- CHANGE ---: Get OncoKB API Token
+# Get OncoKB API Token
 ONCOKB_API_TOKEN = st.secrets.get("ONCOKB_API_KEY")
 
 
@@ -139,6 +140,7 @@ def summarize_with_gemini(prompt):
 
 # --- Processing Logic ---
 def process_tavily_search(variant, search_result):
+    sources = []
     if "error" in search_result:
         summary_data = {"summary": f"Error during search: {search_result['error']}", "warnings": []}
     else:
@@ -168,7 +170,6 @@ if search_button_pressed:
         query_template = st.session_state.query_template
         tumor_type = st.session_state.tumor_type.strip()
         
-        # Create placeholders for each tab
         tab1, tab2, tab3 = st.tabs(["Web Search (Tavily)", "OncoKB Search", "Quick Links (Perplexity)"])
 
         with tab3:
@@ -186,11 +187,11 @@ if search_button_pressed:
             with tab1:
                 st.markdown("### Web Search Summaries (Tavily + Gemini)")
                 with concurrent.futures.ThreadPoolExecutor() as executor:
-                    # Fetch
-                    fetch_futures = {executor.submit(fetch_from_tavily_headless, f"{query_template.format(variant=v)} {'in ' + tumor_type if tumor_type else ''}"): v for v in active_variants}
-                    search_results = {future_to_variant[future]: future.result() for future in concurrent.futures.as_completed(fetch_futures)}
-                    # Summarize
-                    summary_futures = {executor.submit(process_tavily_search, v, search_results[v]): v for v in active_variants}
+                    # --- FIX ---: Renamed 'fetch_futures' to 'future_to_variant'
+                    future_to_variant = {executor.submit(fetch_from_tavily_headless, f"{query_template.format(variant=v)} {'in ' + tumor_type if tumor_type else ''}"): v for v in active_variants}
+                    search_results = {future_to_variant[future]: future.result() for future in concurrent.futures.as_completed(future_to_variant)}
+                    
+                    summary_futures = {executor.submit(process_tavily_search, v, search_results.get(v, {})): v for v in active_variants}
                     for future in concurrent.futures.as_completed(summary_futures):
                         res = future.result()
                         st.markdown(f"#### Summary for `{res['variant']}`")
@@ -207,25 +208,22 @@ if search_button_pressed:
                     st.error("OncoKB search is disabled. Please add your `ONCOKB_API_KEY` to your Streamlit secrets.")
                 else:
                     with concurrent.futures.ThreadPoolExecutor() as executor:
-                        # Parse gene and alteration for OncoKB
                         parsed_variants = []
                         for v in active_variants:
                             parts = v.split(' ', 1)
                             if len(parts) == 2: parsed_variants.append({'gene': parts[0], 'alt': parts[1], 'original': v})
                             else: st.warning(f"Could not parse gene/alteration for '{v}'. Skipping OncoKB search.")
                         
-                        # Fetch
-                        fetch_futures = {executor.submit(fetch_from_oncokb_headless, pv['gene'], pv['alt'], tumor_type): pv['original'] for pv in parsed_variants}
-                        search_results = {future_to_variant[future]: future.result() for future in concurrent.futures.as_completed(fetch_futures)}
+                        # --- FIX ---: Renamed 'fetch_futures' to 'future_to_variant'
+                        future_to_variant = {executor.submit(fetch_from_oncokb_headless, pv['gene'], pv['alt'], tumor_type): pv for pv in parsed_variants}
+                        search_results = {future_to_variant[future]['original']: future.result() for future in concurrent.futures.as_completed(future_to_variant)}
                         
-                        # Summarize
-                        summary_futures = {executor.submit(process_oncokb_search, pv['gene'], pv['alt'], search_results[pv['original']]): pv['original'] for pv in parsed_variants}
+                        summary_futures = {executor.submit(process_oncokb_search, pv['gene'], pv['alt'], search_results.get(pv['original'], {})): pv['original'] for pv in parsed_variants}
                         for future in concurrent.futures.as_completed(summary_futures):
                             res = future.result()
                             st.markdown(f"#### Summary for `{res['variant']}`")
                             st.markdown(res['summary_data']['summary'])
                             
-                            # Display structured OncoKB data
                             if res.get('oncokb_data') and 'query' in res['oncokb_data']:
                                 q = res['oncokb_data']['query']
                                 link = f"https://www.oncokb.org/gene/{q.get('hugoSymbol', '')}/{q.get('alteration', '')}"
@@ -233,4 +231,3 @@ if search_button_pressed:
                                 with st.expander("Show Raw OncoKB Data"):
                                     st.json(res['oncokb_data'])
                             st.divider()
-
