@@ -47,7 +47,7 @@ def search_tavily(query):
 
     api_key = random.choice(API_KEYS)  # Randomly select a key each time
     headers = {"Authorization": f"Bearer {api_key}"}
-    payload = {"query": query, "search_depth": "basic"}
+    payload = {"query": query, "search_depth": "advanced"}  # switched to advanced for better results
     response = requests.post(TAVILY_URL, json=payload, headers=headers)
     if response.status_code == 200:
         result = response.json()
@@ -57,8 +57,11 @@ def search_tavily(query):
         return {"error": f"Request failed with status {response.status_code}"}
 
 # Function to create integrated summary with Gemini and multiple fallbacks
-def summarize_with_gemini(snippets):
-    prompt = f"Summarize the following search snippets into a concise clinical interpretation, focusing on clinical significance, pathogenicity classification (ACMG if available), and evidence sources.\n\n{' '.join(snippets)}"
+def summarize_with_gemini(snippets, variant_name):
+    if not snippets:
+        return f"No relevant snippets found for {variant_name}."
+    
+    prompt = f"Summarize the following search results about {variant_name} into a concise clinical interpretation, focusing on clinical significance, pathogenicity classification (ACMG if available), and evidence sources.\n\n{' '.join(snippets)}"
     models_to_try = [
         "gemini-2.0-flash",
         "gemini-2.0-pro",
@@ -70,11 +73,12 @@ def summarize_with_gemini(snippets):
         try:
             model = genai.GenerativeModel(model_name)
             response = model.generate_content(prompt)
-            return response.text
+            if response and hasattr(response, 'text'):
+                return response.text
         except Exception as e:
             st.warning(f"Model {model_name} failed: {e}. Trying next model...")
     
-    return "Unable to generate summary after trying all backup models."
+    return f"Unable to generate summary for {variant_name} after trying all backup models."
 
 # Search all variants and display integrated summaries
 if st.button("Search Clinical Significance"):
@@ -87,11 +91,6 @@ if st.button("Search Clinical Significance"):
                 st.error(result["error"])
             else:
                 snippets = [r.get("snippet", "") for r in result.get("results", []) if r.get("snippet")]
-                if snippets:
-                    summary = summarize_with_gemini(snippets)
-                    st.markdown(f"**Gemini Clinical Summary:**\n\n{summary}")
-                else:
-                    st.write("No summary available.")
+                summary = summarize_with_gemini(snippets, variant)
+                st.markdown(f"**Gemini Clinical Summary for {variant}:**\n\n{summary}")
                 st.write("---")
-
-
