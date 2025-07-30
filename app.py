@@ -104,13 +104,23 @@ def fetch_from_tavily_headless(query):
         return {"error": f"Tavily API request failed: {e}"}
 
 def fetch_from_oncokb_headless(hugo_symbol, alteration, tumor_type):
+    """
+    FIX: This function now ensures all inputs to the OncoKB API are uppercased
+    to prevent case-sensitivity issues.
+    """
     if not ONCOKB_API_TOKEN:
         return {"error": "OncoKB API Token not configured."}
     
-    api_alteration = alteration[2:] if alteration.lower().startswith('p.') else alteration
-    api_url = f"{ONCOKB_URL}/annotate/mutations/byProteinChange?hugoSymbol={hugo_symbol}&alteration={api_alteration}"
+    # Uppercase all inputs for API compatibility
+    hugo_symbol_upper = hugo_symbol.upper()
+    alteration_upper = alteration.upper()
+    tumor_type_upper = tumor_type.upper()
+
+    api_alteration = alteration_upper[2:] if alteration_upper.startswith('P.') else alteration_upper
+    api_url = f"{ONCOKB_URL}/annotate/mutations/byProteinChange?hugoSymbol={hugo_symbol_upper}&alteration={api_alteration}"
+    
     if tumor_type:
-        api_url += f"&tumorType={tumor_type}"
+        api_url += f"&tumorType={tumor_type_upper}"
     
     headers = {'Authorization': f'Bearer {ONCOKB_API_TOKEN}', 'Accept': 'application/json'}
     try:
@@ -156,8 +166,29 @@ def process_oncokb_search(variant_gene, variant_alt, search_result):
     elif search_result.get('query', {}).get('variant') == "UNKNOWN":
         summary_data = {"summary": "Variant not found in OncoKB.", "warnings": []}
     else:
-        prompt = f"Summarize the clinical significance of '{variant_gene} {variant_alt}' based on this OncoKB data: {json.dumps(search_result)}"
-        summary_data = summarize_with_gemini(prompt)
+        prompt_text = f"Please provide a clinical summary for the variant {variant_gene} {variant_alt} based on the following curated data from OncoKB:\n\n"
+        
+        gene_summary = search_result.get('geneSummary')
+        if gene_summary:
+            prompt_text += f"**Gene Summary:** {gene_summary}\n\n"
+
+        variant_summary = search_result.get('variantSummary')
+        if variant_summary:
+            prompt_text += f"**Variant Summary:** {variant_summary}\n\n"
+        
+        treatments = search_result.get('treatments')
+        if treatments:
+            prompt_text += "**Therapeutic Implications:**\n"
+            for treatment in treatments:
+                drugs = ", ".join([d['drugName'] for d in treatment.get('drugs', [])])
+                level = treatment.get('level', 'N/A').replace('_', ' ')
+                indication = treatment.get('indication', {}).get('name', 'N/A')
+                prompt_text += f"- **Drugs:** {drugs}\n"
+                prompt_text += f"  - **Level:** {level}\n"
+                prompt_text += f"  - **Indication:** {indication}\n\n"
+        
+        summary_data = summarize_with_gemini(prompt_text)
+
     return {"variant": f"{variant_gene} {variant_alt}", "summary_data": summary_data, "oncokb_data": search_result}
 
 
@@ -187,7 +218,6 @@ if search_button_pressed:
             with tab1:
                 st.markdown("### Web Search Summaries (Tavily + Gemini)")
                 with concurrent.futures.ThreadPoolExecutor() as executor:
-                    # --- FIX ---: Renamed 'fetch_futures' to 'future_to_variant'
                     future_to_variant = {executor.submit(fetch_from_tavily_headless, f"{query_template.format(variant=v)} {'in ' + tumor_type if tumor_type else ''}"): v for v in active_variants}
                     search_results = {future_to_variant[future]: future.result() for future in concurrent.futures.as_completed(future_to_variant)}
                     
@@ -214,7 +244,6 @@ if search_button_pressed:
                             if len(parts) == 2: parsed_variants.append({'gene': parts[0], 'alt': parts[1], 'original': v})
                             else: st.warning(f"Could not parse gene/alteration for '{v}'. Skipping OncoKB search.")
                         
-                        # --- FIX ---: Renamed 'fetch_futures' to 'future_to_variant'
                         future_to_variant = {executor.submit(fetch_from_oncokb_headless, pv['gene'], pv['alt'], tumor_type): pv for pv in parsed_variants}
                         search_results = {future_to_variant[future]['original']: future.result() for future in concurrent.futures.as_completed(future_to_variant)}
                         
