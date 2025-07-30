@@ -97,13 +97,13 @@ def summarize_with_gemini(search_content, variant_name):
     return {"summary": final_summary, "warnings": warnings}
 
 # --- Main Logic ---
-def process_variant(variant, search_result):
+def process_variant_summary(variant, search_result):
     """
     Processes a single variant's search result to generate a summary.
     This function is designed to be run in a separate thread.
     """
     if "error" in search_result:
-        summary_data = {"summary": f"Error searching for variant: {search_result['error']}", "warnings": []}
+        summary_data = {"summary": f"Error during search: {search_result['error']}", "warnings": []}
     elif not search_result.get("results"):
         summary_data = {"summary": f"No search results found for `{variant}`.", "warnings": []}
     else:
@@ -120,44 +120,53 @@ if st.button("Search Clinical Significance"):
     else:
         with st.spinner(f"Searching for {len(active_variants)} variant(s) and generating summaries... This may take a moment."):
             
-            # Step 1: Fetch all data (from cache or API) in parallel
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                # Create a map of variant to future object
-                future_to_variant = {}
-                for variant in active_variants:
-                    query = f"clinical significance of genetic variant {variant}"
-                    if query in st.session_state.cache:
-                        # If cached, create a future that just returns the cached data
-                        future = executor.submit(lambda v: st.session_state.cache[v], query)
-                    else:
-                        # If not cached, submit the headless API call to the thread pool
-                        future = executor.submit(fetch_from_tavily_headless, query)
-                    future_to_variant[future] = variant
+            # Step 1: (MAIN THREAD) Separate cached vs. non-cached variants
+            variants_to_fetch = []
+            variant_to_search_result = {}
+            for variant in active_variants:
+                query = f"clinical significance of genetic variant {variant}"
+                if query in st.session_state.cache:
+                    variant_to_search_result[variant] = st.session_state.cache[query]
+                else:
+                    variants_to_fetch.append(variant)
 
-                # Step 2: Process results as they complete
-                variant_to_search_result = {}
-                for future in concurrent.futures.as_completed(future_to_variant):
-                    variant = future_to_variant[future]
-                    try:
-                        search_result = future.result()
-                        variant_to_search_result[variant] = search_result
-                        # Add new results to the cache in the main thread
-                        query = f"clinical significance of genetic variant {variant}"
-                        if query not in st.session_state.cache:
+            # Step 2: (BACKGROUND THREADS) Fetch only the uncached variants from the API
+            if variants_to_fetch:
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future_to_variant = {
+                        executor.submit(fetch_from_tavily_headless, f"clinical significance of genetic variant {variant}"): variant 
+                        for variant in variants_to_fetch
+                    }
+                    
+                    for future in concurrent.futures.as_completed(future_to_variant):
+                        variant = future_to_variant[future]
+                        try:
+                            search_result = future.result()
+                            variant_to_search_result[variant] = search_result
+                            # (MAIN THREAD) Update the cache with the new result
+                            query = f"clinical significance of genetic variant {variant}"
                             st.session_state.cache[query] = search_result
-                    except Exception as exc:
-                        variant_to_search_result[variant] = {"error": f"Generated an exception: {exc}"}
+                        except Exception as exc:
+                            variant_to_search_result[variant] = {"error": f"Generated an exception during search: {exc}"}
 
-            # Step 3: Summarize all results in parallel
+            # Step 3: (BACKGROUND THREADS) Summarize all results in parallel
+            final_results = []
             with concurrent.futures.ThreadPoolExecutor() as executor:
-                summary_futures = [executor.submit(process_variant, variant, result) for variant, result in variant_to_search_result.items()]
-                results = [f.result() for f in concurrent.futures.as_completed(summary_futures)]
+                summary_futures = {
+                    executor.submit(process_variant_summary, variant, result): variant
+                    for variant, result in variant_to_search_result.items()
+                }
+                for future in concurrent.futures.as_completed(summary_futures):
+                    final_results.append(future.result())
 
-            # Step 4: Display results
-            for res in results:
-                st.markdown(f"### Gemini Clinical Summary for `{res['variant']}`")
-                if res["summary_data"]["warnings"]:
-                    for warning_text in res["summary_data"]["warnings"]:
-                        st.warning(warning_text)
-                st.markdown(res["summary_data"]["summary"])
-                st.write("---")
+            # Step 4: (MAIN THREAD) Display results in the original order
+            results_dict = {res['variant']: res for res in final_results}
+            for variant in active_variants:
+                res = results_dict.get(variant)
+                if res:
+                    st.markdown(f"### Gemini Clinical Summary for `{res['variant']}`")
+                    if res["summary_data"]["warnings"]:
+                        for warning_text in res["summary_data"]["warnings"]:
+                            st.warning(warning_text)
+                    st.markdown(res["summary_data"]["summary"])
+                    st.write("---")
