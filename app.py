@@ -155,19 +155,20 @@ def get_available_models():
             if 'generateContent' in m.get('supportedGenerationMethods', [])
         ]
     except Exception as e:
+        # This function is cached, so st.error is safe here as it runs once on main thread
         st.error(f"Could not fetch available models: {e}")
         return []
 
-def summarize_with_gemini(prompt):
+def summarize_with_gemini(prompt, available_models):
     """
-    Summarizes content using Gemini, with a dynamic fallback to available models
-    if the preferred ones fail.
+    Summarizes content using Gemini, with a dynamic fallback to available models.
+    FIX: This function now receives the list of available models as an argument
+    and does not access st.session_state, making it thread-safe.
     """
     warnings = []
     last_error = None
     
-    # --- CHANGE: Dynamic model fallback logic ---
-    preferred_models = ["gemini-1.5-flash-latest", "gemini-pro"] # Keep preferred models
+    preferred_models = ["gemini-1.5-flash-latest", "gemini-pro"]
     models_to_try = preferred_models
 
     for model_name in models_to_try:
@@ -181,15 +182,10 @@ def summarize_with_gemini(prompt):
         except Exception as e:
             last_error = str(e)
             warnings.append(f"Model '{model_name}' failed: {last_error}")
-            # If model is not found, fetch the available models and try them
             if "404" in last_error and "is not found" in last_error:
-                if st.session_state.available_models is None:
-                    st.session_state.available_models = get_available_models()
-                
-                if st.session_state.available_models:
+                if available_models:
                     warnings.append(f"'{model_name}' not found. Trying other available models...")
-                    # Try available models that are not the one that just failed
-                    dynamic_models = [m for m in st.session_state.available_models if m != model_name]
+                    dynamic_models = [m for m in available_models if m != model_name]
                     for dynamic_model_name in dynamic_models:
                         try:
                             model = genai.GenerativeModel(dynamic_model_name)
@@ -201,7 +197,6 @@ def summarize_with_gemini(prompt):
                         except Exception as e_dynamic:
                             last_error = str(e_dynamic)
                             warnings.append(f"Model '{dynamic_model_name}' failed: {last_error}")
-                    # If all dynamic models failed, break the outer loop
                     break
 
     final_summary = "Unable to generate summary."
@@ -212,7 +207,7 @@ def summarize_with_gemini(prompt):
 
 
 # --- Processing Logic ---
-def process_tavily_search(variant, search_result):
+def process_tavily_search(variant, search_result, available_models):
     sources = []
     if "error" in search_result:
         summary_data = {"summary": f"Error during search: {search_result['error']}", "warnings": []}
@@ -220,10 +215,10 @@ def process_tavily_search(variant, search_result):
         content = [r.get("content", "") for r in search_result.get("results", [])]
         sources = [r.get("url") for r in search_result.get("results", []) if r.get("url")]
         prompt = f"Summarize the clinical significance of '{variant}' based on the following text:\n\n{' '.join(content)}"
-        summary_data = summarize_with_gemini(prompt)
+        summary_data = summarize_with_gemini(prompt, available_models)
     return {"variant": variant, "summary_data": summary_data, "sources": sources}
 
-def process_oncokb_search(variant_gene, variant_alt, search_result):
+def process_oncokb_search(variant_gene, variant_alt, search_result, available_models):
     prompt_text = ""
     if "error" in search_result:
         summary_data = {"summary": f"OncoKB API Error: {search_result['error']}", "warnings": []}
@@ -267,7 +262,7 @@ def process_oncokb_search(variant_gene, variant_alt, search_result):
                 indication = treatment.get('indication', {}).get('name', 'N/A')
                 prompt_text += f"- **Drugs:** {drugs} for {indication} (Level: {level})\n"
         
-        summary_data = summarize_with_gemini(prompt_text)
+        summary_data = summarize_with_gemini(prompt_text, available_models)
 
     return {"variant": f"{variant_gene} {variant_alt}", "summary_data": summary_data, "oncokb_data": search_result, "prompt": prompt_text}
 
@@ -295,6 +290,11 @@ if search_button_pressed:
             query_template = st.session_state.query_template
             tumor_type = st.session_state.tumor_type.strip()
             
+            # --- FIX: Fetch available models on the main thread before starting workers ---
+            if st.session_state.available_models is None:
+                st.session_state.available_models = get_available_models()
+            available_models_list = st.session_state.available_models
+            
             with st.spinner("Fetching and summarizing results..."):
 
                 if st.session_state.include_perplexity and "Quick Links (Perplexity)" in tab_map:
@@ -315,7 +315,8 @@ if search_button_pressed:
                             future_to_variant = {executor.submit(fetch_from_tavily_headless, f"{query_template.format(variant=v)} {'in ' + tumor_type if tumor_type else ''}"): v for v in active_variants}
                             search_results = {future_to_variant[future]: future.result() for future in concurrent.futures.as_completed(future_to_variant)}
                             
-                            summary_futures = {executor.submit(process_tavily_search, v, search_results.get(v, {})): v for v in active_variants}
+                            # --- FIX: Pass the list of models to the processing function ---
+                            summary_futures = {executor.submit(process_tavily_search, v, search_results.get(v, {}), available_models_list): v for v in active_variants}
                             for future in concurrent.futures.as_completed(summary_futures):
                                 res = future.result()
                                 st.markdown(f"#### Summary for `{res['variant']}`")
@@ -341,7 +342,8 @@ if search_button_pressed:
                                 future_to_variant = {executor.submit(fetch_from_oncokb_headless, pv['gene'], pv['alt'], tumor_type): pv for pv in parsed_variants}
                                 search_results = {future_to_variant[future]['original']: future.result() for future in concurrent.futures.as_completed(future_to_variant)}
                                 
-                                summary_futures = {executor.submit(process_oncokb_search, pv['gene'], pv['alt'], search_results.get(pv['original'], {})): pv['original'] for pv in parsed_variants}
+                                # --- FIX: Pass the list of models to the processing function ---
+                                summary_futures = {executor.submit(process_oncokb_search, pv['gene'], pv['alt'], search_results.get(pv['original'], {}), available_models_list): pv['original'] for pv in parsed_variants}
                                 for future in concurrent.futures.as_completed(summary_futures):
                                     res = future.result()
                                     st.markdown(f"#### Summary for `{res['variant']}`")
@@ -357,5 +359,4 @@ if search_button_pressed:
                                             st.markdown("**Raw OncoKB Data:**")
                                             st.json(res['oncokb_data'])
                                     st.divider()
-
 
