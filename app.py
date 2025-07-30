@@ -76,17 +76,14 @@ def search_tavily(query):
 
 
 # Function to create integrated summary with Gemini and multiple fallbacks
-def summarize_with_gemini(snippets, variant_name):
+def summarize_with_gemini(search_content, variant_name):
     """
-    Summarizes search snippets using the Gemini API with a fallback model strategy.
-    
-    CORRECTION: Updated the model list to valid and current model names.
-    The previous list contained invalid names like "gemini-2.0-flash".
+    Summarizes search content using the Gemini API with a fallback model strategy.
     """
-    if not snippets:
-        return f"No relevant snippets found for {variant_name} to summarize."
+    if not search_content:
+        return f"No relevant content found for {variant_name} to summarize."
     
-    prompt = f"Summarize the following search results about the genetic variant '{variant_name}' into a concise clinical interpretation. Focus on its clinical significance, pathogenicity classification (mentioning ACMG guidelines if available), associated conditions, and cite the evidence sources from the text.\n\n---BEGIN SNIPPETS---\n{' '.join(snippets)}\n---END SNIPPETS---"
+    prompt = f"Summarize the following search results about the genetic variant '{variant_name}' into a concise clinical interpretation. Focus on its clinical significance, pathogenicity classification (mentioning ACMG guidelines if available), associated conditions, and cite the evidence sources from the text.\n\n---BEGIN SEARCH CONTENT---\n{' '.join(search_content)}\n---END SEARCH CONTENT---"
     
     # List of valid models to try, from fastest/cheapest to most powerful
     models_to_try = [
@@ -129,19 +126,16 @@ if st.button("Search Clinical Significance"):
                 st.write(f"**Searching for:** `{variant}`")
                 
                 result = search_tavily(query)
-                
-                # --- DEBUGGING LINE ---
-                # Display the raw JSON result from the Tavily API to inspect its contents.
-                st.json(result)
 
                 if "error" in result:
                     st.error(result["error"])
                 elif not result.get("results"):
                      st.warning(f"No search results found for `{variant}`.")
                 else:
-                    # Extract snippets, ensuring they are not empty
-                    snippets = [r.get("snippet", "") for r in result.get("results", []) if r.get("snippet")]
-                    summary = summarize_with_gemini(snippets, variant)
+                    # --- FIX ---
+                    # Changed from .get("snippet") to .get("content") to match the Tavily API response.
+                    content_list = [r.get("content", "") for r in result.get("results", []) if r.get("content")]
+                    summary = summarize_with_gemini(content_list, variant)
                     
                     st.markdown(f"### Gemini Clinical Summary for `{variant}`")
                     st.markdown(summary)
