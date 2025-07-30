@@ -38,6 +38,7 @@ ONCOKB_API_TOKEN = st.secrets.get("ONCOKB_API_KEY")
 # --- Constants ---
 TAVILY_URL = "https://api.tavily.com/search"
 ONCOKB_URL = "https://www.oncokb.org/api/v1"
+GEMINI_MODELS_API = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
 
 
 # --- Session State Initialization ---
@@ -55,6 +56,8 @@ if "include_oncokb" not in st.session_state:
     st.session_state.include_oncokb = True
 if "include_perplexity" not in st.session_state:
     st.session_state.include_perplexity = True
+if "available_models" not in st.session_state:
+    st.session_state.available_models = None
 
 
 # --- UI Components ---
@@ -140,26 +143,67 @@ def fetch_from_oncokb_headless(hugo_symbol, alteration, tumor_type):
     except requests.exceptions.RequestException as e:
         return {'error': f"Network Error: {e}"}
 
+@st.cache_data
+def get_available_models():
+    """Gets a list of available Gemini models that support generateContent."""
+    try:
+        response = requests.get(GEMINI_MODELS_API)
+        response.raise_for_status()
+        models_data = response.json()
+        return [
+            m['name'].split('/')[-1] for m in models_data.get('models', [])
+            if 'generateContent' in m.get('supportedGenerationMethods', [])
+        ]
+    except Exception as e:
+        st.error(f"Could not fetch available models: {e}")
+        return []
+
 def summarize_with_gemini(prompt):
     """
-    FIX: This function now captures and returns the last error message if all
-    API calls fail, providing better debugging information.
+    Summarizes content using Gemini, with a dynamic fallback to available models
+    if the preferred ones fail.
     """
     warnings = []
     last_error = None
-    models_to_try = ["gemini-1.5-flash-latest", "gemini-pro"]
+    
+    # --- CHANGE: Dynamic model fallback logic ---
+    preferred_models = ["gemini-1.5-flash-latest", "gemini-pro"] # Keep preferred models
+    models_to_try = preferred_models
+
     for model_name in models_to_try:
         try:
             model = genai.GenerativeModel(model_name)
             response = model.generate_content(prompt)
             if response.text:
                 return {"summary": response.text, "warnings": warnings, "error": None}
-            warnings.append(f"Model {model_name} returned an empty or blocked response.")
+            warnings.append(f"Model '{model_name}' returned an empty or blocked response.")
             last_error = "Model returned an empty or blocked response."
         except Exception as e:
-            warnings.append(f"Model {model_name} failed: {e}")
             last_error = str(e)
-            
+            warnings.append(f"Model '{model_name}' failed: {last_error}")
+            # If model is not found, fetch the available models and try them
+            if "404" in last_error and "is not found" in last_error:
+                if st.session_state.available_models is None:
+                    st.session_state.available_models = get_available_models()
+                
+                if st.session_state.available_models:
+                    warnings.append(f"'{model_name}' not found. Trying other available models...")
+                    # Try available models that are not the one that just failed
+                    dynamic_models = [m for m in st.session_state.available_models if m != model_name]
+                    for dynamic_model_name in dynamic_models:
+                        try:
+                            model = genai.GenerativeModel(dynamic_model_name)
+                            response = model.generate_content(prompt)
+                            if response.text:
+                                return {"summary": response.text, "warnings": warnings, "error": None}
+                            warnings.append(f"Model '{dynamic_model_name}' returned an empty or blocked response.")
+                            last_error = "Model returned an empty or blocked response."
+                        except Exception as e_dynamic:
+                            last_error = str(e_dynamic)
+                            warnings.append(f"Model '{dynamic_model_name}' failed: {last_error}")
+                    # If all dynamic models failed, break the outer loop
+                    break
+
     final_summary = "Unable to generate summary."
     if last_error:
         final_summary += f" Last known error: {last_error}"
@@ -180,9 +224,6 @@ def process_tavily_search(variant, search_result):
     return {"variant": variant, "summary_data": summary_data, "sources": sources}
 
 def process_oncokb_search(variant_gene, variant_alt, search_result):
-    """
-    FIX: This function now returns the generated prompt for debugging purposes.
-    """
     prompt_text = ""
     if "error" in search_result:
         summary_data = {"summary": f"OncoKB API Error: {search_result['error']}", "warnings": []}
@@ -306,7 +347,6 @@ if search_button_pressed:
                                     st.markdown(f"#### Summary for `{res['variant']}`")
                                     st.markdown(res['summary_data']['summary'])
                                     
-                                    # --- CHANGE: Display prompt and raw data for debugging ---
                                     if res.get('oncokb_data') and 'query' in res['oncokb_data']:
                                         q = res['oncokb_data']['query']
                                         link = f"https://www.oncokb.org/gene/{q.get('hugoSymbol', '')}/{q.get('alteration', '')}"
@@ -317,4 +357,5 @@ if search_button_pressed:
                                             st.markdown("**Raw OncoKB Data:**")
                                             st.json(res['oncokb_data'])
                                     st.divider()
+
 
