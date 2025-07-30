@@ -49,7 +49,6 @@ if "query_template" not in st.session_state:
     st.session_state.query_template = "clinical significance of genetic variant {variant}"
 if "tumor_type" not in st.session_state:
     st.session_state.tumor_type = ""
-# --- CHANGE ---: Add checkboxes to session state
 if "include_tavily" not in st.session_state:
     st.session_state.include_tavily = True
 if "include_oncokb" not in st.session_state:
@@ -75,7 +74,6 @@ with st.sidebar:
         help="Applies to both Web and OncoKB searches (e.g., 'Melanoma')."
     )
     
-    # --- CHANGE ---: Add checkboxes to control data sources
     st.header("Data Sources to Query")
     st.session_state.include_tavily = st.checkbox("Tavily Web Search", value=st.session_state.include_tavily)
     st.session_state.include_oncokb = st.checkbox("OncoKB Database", value=st.session_state.include_oncokb)
@@ -170,6 +168,10 @@ def process_tavily_search(variant, search_result):
     return {"variant": variant, "summary_data": summary_data, "sources": sources}
 
 def process_oncokb_search(variant_gene, variant_alt, search_result):
+    """
+    FIX: This function now extracts diagnostic and prognostic implications
+    to build a much richer, more effective prompt for the summarization model.
+    """
     if "error" in search_result:
         summary_data = {"summary": f"OncoKB API Error: {search_result['error']}", "warnings": []}
     elif search_result.get('query', {}).get('variant') == "UNKNOWN":
@@ -185,6 +187,26 @@ def process_oncokb_search(variant_gene, variant_alt, search_result):
         if variant_summary:
             prompt_text += f"**Variant Summary:** {variant_summary}\n\n"
         
+        # --- CHANGE: Extract Diagnostic Implications ---
+        diag_implications = search_result.get('diagnosticImplications')
+        if diag_implications:
+            prompt_text += "**Diagnostic Implications:**\n"
+            for item in diag_implications:
+                level = item.get('levelOfEvidence', 'N/A').replace('_', ' ')
+                tumor_name = item.get('tumorType', {}).get('name', 'N/A')
+                prompt_text += f"- **Tumor Type:** {tumor_name} (Level: {level})\n"
+            prompt_text += "\n"
+
+        # --- CHANGE: Extract Prognostic Implications ---
+        prog_implications = search_result.get('prognosticImplications')
+        if prog_implications:
+            prompt_text += "**Prognostic Implications:**\n"
+            for item in prog_implications:
+                level = item.get('levelOfEvidence', 'N/A').replace('_', ' ')
+                tumor_name = item.get('tumorType', {}).get('name', 'N/A')
+                prompt_text += f"- **Tumor Type:** {tumor_name} (Level: {level})\n"
+            prompt_text += "\n"
+
         treatments = search_result.get('treatments')
         if treatments:
             prompt_text += "**Therapeutic Implications:**\n"
@@ -192,9 +214,7 @@ def process_oncokb_search(variant_gene, variant_alt, search_result):
                 drugs = ", ".join([d['drugName'] for d in treatment.get('drugs', [])])
                 level = treatment.get('level', 'N/A').replace('_', ' ')
                 indication = treatment.get('indication', {}).get('name', 'N/A')
-                prompt_text += f"- **Drugs:** {drugs}\n"
-                prompt_text += f"  - **Level:** {level}\n"
-                prompt_text += f"  - **Indication:** {indication}\n\n"
+                prompt_text += f"- **Drugs:** {drugs} for {indication} (Level: {level})\n"
         
         summary_data = summarize_with_gemini(prompt_text)
 
@@ -207,7 +227,6 @@ if search_button_pressed:
     if not active_variants:
         st.warning("Please enter at least one variant to search.")
     else:
-        # --- CHANGE ---: Build list of tabs based on user selection
         tabs_to_show = []
         if st.session_state.include_tavily:
             tabs_to_show.append("Web Search (Tavily)")
@@ -219,7 +238,6 @@ if search_button_pressed:
         if not tabs_to_show:
             st.warning("Please select at least one data source to query.")
         else:
-            # Create the tabs dynamically
             created_tabs = st.tabs(tabs_to_show)
             tab_map = {name: tab for name, tab in zip(tabs_to_show, created_tabs)}
 
